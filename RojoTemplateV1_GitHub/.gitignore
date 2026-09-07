@@ -1,0 +1,12 @@
+.build/
+.tools/
+_versions/
+.rojo-template/STATE.json
+
+# Common local/editor noise
+.vscode/
+.idea/
+*.log
+*.tmp
+.DS_Store
+Thumbs.db
