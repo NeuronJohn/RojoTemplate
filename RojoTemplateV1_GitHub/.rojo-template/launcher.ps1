@@ -15,6 +15,7 @@ $StateFile = Join-Path $SystemDir "STATE.json"
 $BuildDir = Join-Path $Root ".build"
 $ToolsDir = Join-Path $Root ".tools\rojo"
 $VersionsDir = Join-Path $Root "_versions"
+$DeleteManifest = Join-Path $Root "_AI_DELETE.txt"
 
 $script:HadWarning = $false
 $script:LauncherFinished = $false
@@ -92,6 +93,79 @@ function Continue-Anyway([string]$Reason) {
     }
 
     return ($answer -match '^[Yy]')
+}
+
+function Apply-DeleteManifest {
+    if (-not (Test-Path -LiteralPath $DeleteManifest)) {
+        return
+    }
+
+    Write-Step "Applying AI deletion manifest"
+
+    if (-not (Test-Path -LiteralPath $SrcDir)) {
+        throw "Cannot apply _AI_DELETE.txt because src is missing."
+    }
+
+    $srcFull = [System.IO.Path]::GetFullPath($SrcDir).TrimEnd('\','/')
+    $targets = @()
+    $seen = @{}
+
+    foreach ($rawLine in (Get-Content -LiteralPath $DeleteManifest -ErrorAction Stop)) {
+        $entry = ([string]$rawLine).Trim()
+
+        if ([string]::IsNullOrWhiteSpace($entry) -or $entry.StartsWith("#")) {
+            continue
+        }
+
+        if ([System.IO.Path]::IsPathRooted($entry)) {
+            throw "_AI_DELETE.txt contains an absolute path, which is not allowed: $entry"
+        }
+
+        $normalized = $entry.Replace('/', '\').TrimStart('\')
+        $target = [System.IO.Path]::GetFullPath((Join-Path $Root $normalized))
+
+        if ($target.Equals($srcFull, [System.StringComparison]::OrdinalIgnoreCase) -or
+            -not $target.StartsWith($srcFull + '\', [System.StringComparison]::OrdinalIgnoreCase)) {
+            throw "_AI_DELETE.txt may only delete paths inside src/: $entry"
+        }
+
+        if (-not $seen.ContainsKey($target)) {
+            $seen[$target] = $true
+            $targets += [pscustomobject]@{
+                Entry = $entry.Replace('\','/')
+                Full = $target
+            }
+        }
+    }
+
+    # Validate the entire manifest before deleting anything.
+    foreach ($item in $targets) {
+        if ($item.Entry -match '(^|/)\.\.(/|$)') {
+            throw "_AI_DELETE.txt contains path traversal, which is not allowed: $($item.Entry)"
+        }
+    }
+
+    foreach ($item in $targets) {
+        if (Test-Path -LiteralPath $item.Full) {
+            Remove-Item -LiteralPath $item.Full -Recurse -Force -ErrorAction Stop
+            Write-Host "Deleted : $($item.Entry)" -ForegroundColor Green
+        }
+        else {
+            Write-Host "Absent  : $($item.Entry)" -ForegroundColor DarkGray
+        }
+    }
+
+    # Clean up empty source directories left behind by deleted/renamed files.
+    Get-ChildItem -LiteralPath $SrcDir -Directory -Recurse -Force -ErrorAction SilentlyContinue |
+        Sort-Object { $_.FullName.Length } -Descending |
+        ForEach-Object {
+            if (-not (Get-ChildItem -LiteralPath $_.FullName -Force -ErrorAction SilentlyContinue | Select-Object -First 1)) {
+                Remove-Item -LiteralPath $_.FullName -Force -ErrorAction SilentlyContinue
+            }
+        }
+
+    Remove-Item -LiteralPath $DeleteManifest -Force -ErrorAction Stop
+    Write-Host "Deletion manifest applied and consumed." -ForegroundColor Green
 }
 
 function Get-ProjectHash {
@@ -275,10 +349,145 @@ function Find-Studio {
     return $null
 }
 
+function Get-StudiosUsingProjectBuild {
+    $matches = @()
+
+    try {
+        $buildPrefix = ([System.IO.Path]::GetFullPath($BuildDir).TrimEnd('\','/') + '\').ToLowerInvariant()
+        $studioProcesses = Get-CimInstance Win32_Process -Filter "Name='RobloxStudioBeta.exe'" -ErrorAction Stop
+
+        foreach ($studioProcess in $studioProcesses) {
+            $commandLine = [string]$studioProcess.CommandLine
+            if ([string]::IsNullOrWhiteSpace($commandLine)) {
+                continue
+            }
+
+            $normalizedCommand = $commandLine.Replace('/', '\').ToLowerInvariant()
+            if (-not $normalizedCommand.Contains($buildPrefix)) {
+                continue
+            }
+
+            try {
+                $process = Get-Process -Id ([int]$studioProcess.ProcessId) -ErrorAction Stop
+                $matches += $process
+            }
+            catch {}
+        }
+    }
+    catch {
+        # Process command-line inspection is a convenience. Build replacement
+        # still has a single-Studio fallback if CIM inspection is unavailable.
+    }
+
+    return @($matches)
+}
+
+function Focus-StudioProcess([System.Diagnostics.Process]$Process) {
+    try {
+        $Process.Refresh()
+
+        try {
+            $shell = New-Object -ComObject WScript.Shell
+            [void]$shell.AppActivate([int]$Process.Id)
+        }
+        catch {}
+
+        if ($Process.MainWindowHandle -ne 0) {
+            if (-not ([System.Management.Automation.PSTypeName]'RojoTemplateNativeWindow').Type) {
+                Add-Type @"
+using System;
+using System.Runtime.InteropServices;
+public static class RojoTemplateNativeWindow {
+    [DllImport("user32.dll")]
+    public static extern bool SetForegroundWindow(IntPtr hWnd);
+
+    [DllImport("user32.dll")]
+    public static extern bool ShowWindowAsync(IntPtr hWnd, int nCmdShow);
+}
+"@
+            }
+
+            [void][RojoTemplateNativeWindow]::ShowWindowAsync($Process.MainWindowHandle, 9)
+            [void][RojoTemplateNativeWindow]::SetForegroundWindow($Process.MainWindowHandle)
+        }
+
+        return $true
+    }
+    catch {
+        return $false
+    }
+}
+
+function Wait-ForProjectStudioToClose {
+    $announcedPids = @{}
+
+    while ($true) {
+        $studios = @(Get-StudiosUsingProjectBuild)
+        if ($studios.Count -eq 0) {
+            return
+        }
+
+        $studio = $studios | Select-Object -First 1
+        if (-not $announcedPids.ContainsKey($studio.Id)) {
+            Write-Host ""
+            Write-Host "Roblox Studio is using this project's current .build file." -ForegroundColor Yellow
+            Write-Host "Focusing that Studio window now. Close it when ready; this launcher will resume automatically." -ForegroundColor Yellow
+            [void](Focus-StudioProcess $studio)
+            $announcedPids[$studio.Id] = $true
+        }
+
+        Start-Sleep -Milliseconds 600
+    }
+}
+
+function Install-BuildFile([string]$TempBuild, [string]$DestinationBuild) {
+    Wait-ForProjectStudioToClose
+
+    $attempt = 0
+    $lastFocusedPid = -1
+
+    while ($true) {
+        try {
+            Get-ChildItem -LiteralPath $BuildDir -Force -ErrorAction SilentlyContinue |
+                Remove-Item -Recurse -Force -ErrorAction Stop
+
+            Move-Item -LiteralPath $TempBuild -Destination $DestinationBuild -Force -ErrorAction Stop
+            return
+        }
+        catch {
+            $attempt++
+            $studios = @(Get-StudiosUsingProjectBuild)
+
+            if ($studios.Count -eq 0) {
+                $allStudios = @(Get-Process -Name "RobloxStudioBeta" -ErrorAction SilentlyContinue)
+                if ($allStudios.Count -eq 1) {
+                    $studios = $allStudios
+                }
+            }
+
+            if ($studios.Count -eq 0 -or $attempt -gt 240) {
+                throw "Could not replace the current .build file: $($_.Exception.Message)"
+            }
+
+            $studio = $studios | Select-Object -First 1
+            if ($studio.Id -ne $lastFocusedPid) {
+                Write-Host ""
+                Write-Host "The current build is locked by Roblox Studio." -ForegroundColor Yellow
+                Write-Host "Focusing Studio. Close that window; this launcher will keep retrying and continue automatically." -ForegroundColor Yellow
+                [void](Focus-StudioProcess $studio)
+                $lastFocusedPid = $studio.Id
+            }
+
+            Start-Sleep -Milliseconds 500
+        }
+    }
+}
+
 function Open-Studio([string]$PlaceFile) {
     $studio = Find-Studio
     if ($studio) {
-        Start-Process -FilePath $studio -ArgumentList @("--task", "EditFile", "--localPlaceFile", $PlaceFile)
+        $quotedPlaceFile = '"' + $PlaceFile + '"'
+        Start-Process -FilePath $studio -ArgumentList @("--task", "EditFile", "--localPlaceFile", $quotedPlaceFile)
         return
     }
 
@@ -531,6 +740,8 @@ if (-not (Test-Path -LiteralPath $VersionFile)) { throw "version.txt is missing.
 if (-not (Test-Path -LiteralPath $ProjectFile)) { throw "default.project.json is missing." }
 if (-not (Test-Path -LiteralPath $SrcDir)) { throw "src is missing." }
 
+Apply-DeleteManifest
+
 $ProjectName = Split-Path -Leaf $Root
 $Version = (Get-Content -LiteralPath $VersionFile -Raw).Trim()
 
@@ -590,8 +801,9 @@ try {
     }
 
     # .build contains only the current rbxl after a successful build.
-    Get-ChildItem -LiteralPath $BuildDir -Force -ErrorAction SilentlyContinue | Remove-Item -Recurse -Force
-    Move-Item -LiteralPath $TempBuild -Destination $BuildFile -Force
+    # If Studio has the previous build open, focus it and wait rather than
+    # forcing the user to restart this launcher.
+    Install-BuildFile $TempBuild $BuildFile
 }
 catch {
     Remove-Item -LiteralPath $TempBuild -Force -ErrorAction SilentlyContinue
