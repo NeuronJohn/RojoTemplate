@@ -118,7 +118,7 @@ Use:
 - `0.0.X` for normal features, fixes, tuning, hotfixes, and smaller changes.
 - A very short `UpdateName`.
 
-Every AI-delivered update should include a newly bumped `version.txt`.
+`version.txt` is the version of an actual game made from this template. Game updates should bump it; maintenance of the reusable template itself should leave the starter value at `0.0.0_Foundation`.
 
 The launcher computes one deterministic SHA-256 project hash from:
 
@@ -185,7 +185,7 @@ ai-sync
 
 ## AI updates
 
-AI update ZIPs normally contain only:
+AI update ZIPs for an actual game normally contain only:
 
 ```text
 version.txt
