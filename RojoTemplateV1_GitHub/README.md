@@ -2,7 +2,7 @@
 
 A minimal Windows-first Rojo + Roblox project template for AI-heavy development.
 
-Run **`start.bat`**. The template handles Rojo, building, version backups, project-state hashing, optional GitHub `ai-sync`, and opening Roblox Studio.
+Run **`start.bat`**. The template handles Rojo, building, version backups, project-state hashing, optional GitHub `ai-sync`, safe AI-file deletions, and opening Roblox Studio.
 
 ## Project layout
 
@@ -102,6 +102,8 @@ The version ZIP contains the meaningful project files plus that version's `.rbxl
 
 Rojo builds the complete place before Studio opens, so the normal workflow does not require a persistent Rojo connection.
 
+If this project's generated `.rbxl` is already open in Roblox Studio and blocks replacement, the launcher attempts to identify that Studio process, brings it to the foreground, and waits. Close that Studio window and the same `start.bat` run resumes automatically; you should not need to restart it.
+
 ## Versioning
 
 `version.txt` contains one line:
@@ -183,7 +185,7 @@ ai-sync
 
 ## AI updates
 
-AI update ZIPs should contain only:
+AI update ZIPs normally contain only:
 
 ```text
 version.txt
@@ -192,7 +194,26 @@ version.txt
 
 Extract over the existing project and replace changed files, then run `start.bat`.
 
-The launcher regenerates its state automatically. There is no per-file manifest.
+### Deleting or renaming files safely
+
+Normal copy-over ZIP extraction cannot remove files that no longer exist in the new version. To prevent stale scripts, any AI update that deletes or renames source files should also contain:
+
+```text
+_AI_DELETE.txt
+```
+
+The file contains one old project-relative path per line, for example:
+
+```text
+src/client/OldController.client.lua
+src/shared/OldConfig.lua
+```
+
+Only paths under `src/` are accepted. Absolute paths, wildcards, and `..` traversal are rejected.
+
+On the next `start.bat` run, the launcher validates the entire manifest first, deletes the listed old files, removes empty source folders, consumes `_AI_DELETE.txt`, and only then calculates the project hash and builds. Renames are represented by deleting the old path and including the new file at its new path.
+
+The launcher regenerates its state automatically. There is no permanent per-file manifest.
 
 ## License
 
